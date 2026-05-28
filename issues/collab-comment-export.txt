@@ -1,0 +1,115 @@
+Collaborative comment export bug — investigation notes
+======================================================
+
+SYMPTOM
+-------
+In a collaborative session, User A opens a document that has comments and can
+export to .docx with the comments preserved. A second user (User B) connects to
+the same session and SEES the comments rendered correctly, but when User B
+exports, the comments are LOST (missing from the exported .docx).
+
+
+ROOT CAUSE: comments travel on two separate channels, and only one reliably
+reaches User B
+-----------------------------------------------------------------------------
+A comment in SuperDoc is two distinct things stored in two different places:
+
+1. The anchor (commentRangeStart / commentRangeEnd marks)
+   - Lives IN the ProseMirror document.
+   - Syncs over Yjs as part of the doc itself.
+   - This is why User B SEES the comments — the highlighted ranges are part of
+     the synced doc state.
+
+2. The comment definition (author, text, docxCommentJSON, resolved state, etc.)
+   - Lives in a SEPARATE Vue store: commentsStore.commentsList.
+   - Mirrored over collaboration through a DIFFERENT, separate Y array:
+     ydoc.getArray('comments')
+     (packages/superdoc/src/core/collaboration/collaboration-comments.js,
+      packages/superdoc/src/core/collaboration/helpers.js -> loadCommentsFromYdoc)
+
+Export reads the DEFINITIONS from the UI store, not from the document:
+   - packages/superdoc/src/core/SuperDoc.ts:2150-2163
+   - When modules.comments !== false (comments UI on, the normal case), the
+     store is treated as AUTHORITATIVE:
+         comments = this.commentsStore.translateCommentsForExport();
+     It deliberately does NOT fall back to converter.comments (the importer's
+     raw parsed copy). That fallback only fires when the store is unhydrated.
+
+So whoever exports emits exactly what is in their own commentsList.
+
+
+WHY USER A IS FINE BUT USER B LOSES THEM
+----------------------------------------
+User A (the importer):
+  - shouldLoadComments is true, so onCommentsLoaded -> processLoadedDocxComments
+    runs (SuperDoc.vue:386, comments-store.js:1260), calling addComment for
+    every imported comment.
+  - That populates User A's commentsList (export works) AND is supposed to push
+    each comment into the 'comments' Y array via:
+        addComment -> syncCommentsToClients -> addYComment
+
+User B (the joiner):
+  - Joins with shouldLoadComments = false. It is explicitly forced off when
+    collaboration attaches, precisely to avoid double-importing
+    (Editor.ts:2390; default at Editor.ts:768).
+  - So User B NEVER runs processLoadedDocxComments. User B's commentsList is
+    populated SOLELY by loadCommentsFromYdoc, which reads the 'comments' Y array
+    (helpers.js:13-50).
+
+The failure: the imported comment DEFINITIONS do not reliably make it into the
+'comments' Y array, while the anchor marks always do (they ride the document).
+
+Most likely concrete trigger: syncCommentsToClients bails early —
+    if (!superdoc.isCollaborative || !superdoc.config.modules.comments) return;
+processLoadedDocxComments runs in a nextTick/setTimeout right after import. If
+at that moment collaboration is not fully wired (or the importer opened the doc
+before the room was collaborative), every imported comment's addComment call
+sees isCollaborative === false, so NOTHING gets pushed to the 'comments' Y array.
+  - User A is unaffected (local list is full).
+  - User B hydrates from an empty/partial Y array, still sees the highlights
+    (anchors from the synced doc), but exports with no comment definitions.
+
+
+KEY FILES / REFERENCES
+----------------------
+- packages/superdoc/src/core/SuperDoc.ts:2150-2163
+    Export decision logic; store treated as authoritative, converter.comments
+    fallback bypassed when modules.comments !== false.
+- packages/superdoc/src/stores/comments-store.js:1260  (processLoadedDocxComments)
+- packages/superdoc/src/stores/comments-store.js:1084  (addComment)
+- packages/superdoc/src/stores/comments-store.js:1797  (translateCommentsForExport)
+- packages/superdoc/src/core/collaboration/helpers.js:13  (loadCommentsFromYdoc)
+- packages/superdoc/src/core/collaboration/helpers.js:171 (syncCommentsToClients,
+    with the early-return guard)
+- packages/superdoc/src/core/collaboration/collaboration-comments.js (addYComment etc.)
+- packages/superdoc/src/SuperDoc.vue:386  (onCommentsLoaded gate on shouldLoadComments)
+- packages/super-editor/src/editors/v1/core/Editor.ts:768, 2390  (shouldLoadComments default / forced off on collab attach)
+- packages/super-editor/src/editors/v1/core/Editor.ts:3680  (effectiveComments = comments ?? converter.comments ?? [])
+- packages/superdoc/src/components/CommentsLayer/use-comment.js:238 (getValues — what gets serialized into the Y array, includes docxCommentJSON)
+
+
+HOW TO CONFIRM (no code change)
+-------------------------------
+In a live session where User B sees the comments, run in User B's console:
+
+    superdoc.ydoc.getArray('comments').toJSON()      // definitions actually synced to B?
+    superdoc.commentsStore.commentsList.length        // what export will read
+    superdoc.activeEditor.converter.comments           // the bypassed importer fallback
+
+If the first two are empty/short while the doc clearly shows comments, that
+confirms it: the anchors synced but the definition Y array was never seeded.
+
+
+FIX DIRECTIONS (once confirmed)
+-------------------------------
+- Most robust: seed the 'comments' Y array as part of room initialization so it
+  never depends on the importer's isCollaborative timing — same lifecycle that
+  seeds the PM doc.
+- Targeted: in processLoadedDocxComments, after import, reconcile imported
+  comments into the Y array even if isCollaborative flipped on late (re-run the
+  sync once the provider is 'synced').
+- Safety net for export: when the store is hydrated but yields fewer comments
+  than converter.comments has AND the doc still contains comment anchor marks,
+  merge / fall back rather than trusting an under-populated store as authoritative.
+
+Recommended: seed the Y array at room init + the export safety net.
